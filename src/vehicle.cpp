@@ -22,6 +22,13 @@
 
 namespace TeslaBLE {
 
+namespace {
+bool is_poll_command_name(const std::string &name) {
+  return name == "VCSEC Poll" || name == "Charge State Poll" || name == "Climate State Poll" ||
+         name == "Drive State Poll" || name == "Closures State Poll" || name == "Tire Pressure Poll";
+}
+}  // namespace
+
 Vehicle::Vehicle(const std::shared_ptr<BleAdapter> &ble, const std::shared_ptr<StorageAdapter> &storage)
     : ble_adapter_(ble),
       storage_adapter_(storage),
@@ -84,8 +91,31 @@ void Vehicle::send_command(UniversalMessage_Domain domain, const std::string &na
     if (on_complete) on_complete(CommandError::connection_lost());
     return;
   }
+
+  // Polls are idempotent. The front command remains in command_queue_ while it is
+  // authenticating or waiting for a response, so this also coalesces an in-flight poll.
+  // Never coalesce commands that carry a completion callback, and never coalesce controls.
+  if (!on_complete && is_poll_command_name(name)) {
+    auto pending = command_queue_;
+    while (!pending.empty()) {
+      const auto &queued = pending.front();
+      if (queued && queued->name == name) {
+        // If the queued request has not started yet, preserve a newer request's
+        // stronger wake requirement instead of silently downgrading it.
+        if (queued->state == CommandState::IDLE && requires_wake) {
+          queued->requires_wake = true;
+        }
+        LOG_DEBUG("Skipping duplicate poll already queued/in progress: %s", name.c_str());
+        return;
+      }
+      pending.pop();
+    }
+  }
+
   if (command_queue_.size() >= MAX_COMMAND_QUEUE_SIZE) {
-    LOG_WARNING("Command queue full, rejecting command: %s", name.c_str());
+    LOG_WARNING("Command queue full (%lu/%lu), rejecting command: %s",
+                static_cast<unsigned long>(command_queue_.size()),
+                static_cast<unsigned long>(MAX_COMMAND_QUEUE_SIZE), name.c_str());
     if (on_complete) on_complete(CommandError::build_failed("queue full"));
     return;
   }
@@ -793,8 +823,14 @@ void Vehicle::vcsec_poll() {
 }
 
 void Vehicle::infotainment_poll(bool force_wake) {
-  drive_state_poll(force_wake);       
-  closures_state_poll(force_wake);    
+  // Keep the full legacy aggregate-poll behaviour for explicit refreshes.
+  // TeslaBLEVehicle::update() schedules the low-priority polls separately at
+  // controlled intervals, so its periodic path must not call this aggregate.
+  drive_state_poll(force_wake);
+  closures_state_poll(force_wake);
+  charge_state_poll(force_wake);
+  climate_state_poll(force_wake);
+  tire_pressure_poll(force_wake);
 }
 
 void Vehicle::send_infotainment_poll_(const std::string &name, int32_t data_type, bool force_wake) {
