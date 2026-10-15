@@ -1035,8 +1035,12 @@ void Vehicle::start_driving() {
         if (error) LOG_ERROR("Remote drive failed: %s", error->message().c_str());
         else {
           LOG_INFO("Remote drive command completed successfully");
+          // Refresh time-sensitive state only. Charge, climate, and tire-pressure
+          // polls are paced by TeslaBLEVehicle::update(); batching them after every
+          // successful RemoteDrive would bypass that schedule and grow the FIFO queue.
           vcsec_poll();
-          infotainment_poll(true);
+          drive_state_poll(true);
+          closures_state_poll(true);
         }
       },
       true);
